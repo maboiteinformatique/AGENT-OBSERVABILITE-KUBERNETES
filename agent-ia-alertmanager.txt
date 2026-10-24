@@ -1,0 +1,608 @@
+========================================================================
+SESSION MENTORAT SRE — Agent IA d'alerting (AlertManager)
+Date : 2026-07-13
+========================================================================
+
+POINT DE DÉPART : « agent IA pour l'infra »
+------------------------------------------------------------------------
+4 pistes proposées par l'IA :
+1. Déployer un agent LLM dans k3s — un pod/service dans le cluster
+   (API Claude + kubectl) capable de diagnostiquer et d'agir sur l'infra.
+2. Agent d'alerting intelligent — branché sur AlertManager/Prometheus :
+   il reçoit les alertes, analyse logs/events/métriques et propose ou
+   applique un correctif.                              ← CHOIX RETENU
+3. Config de Claude Code pour l'infra — améliorer le workspace :
+   skills, hooks, permissions kubectl, commandes custom pour piloter
+   le cluster.
+4. Agent CI/CD — branché sur Woodpecker/Gitea : review des commits,
+   réparation des pipelines cassés, etc.
+
+Mode de travail : Claude joue le rôle de MENTOR (guide, explique,
+laisse faire), David (SRE/DevOps) réalise les manipulations.
+
+
+OBJECTIF DU PROJET
+------------------
+Construire un agent IA d'alerting intelligent : branché sur
+AlertManager/Prometheus, il reçoit les alertes (via webhook), analyse
+le problème (logs, events, métriques) et propose un diagnostic.
+
+
+QUESTIONS / RÉPONSES
+------------------------------------------------------------------------
+
+Q1. Comment l'agent recevra-t-il les alertes ?
+R1. AlertManager sait envoyer les alertes vers un "webhook receiver".
+    L'agent sera un petit service HTTP dans le cluster qui reçoit ce
+    POST, puis enquête (kubectl, logs) et produit un diagnostic.
+    Question ouverte posée : de quoi le pod aura-t-il besoin pour
+    enquêter, et quel risque de sécurité ça pose ? (indice : identité
+    du pod → ServiceAccount / RBAC)
+
+Q2. Je n'ai jamais utilisé AlertManager, c'est quoi ?
+R2. Il tourne déjà dans le cluster (installé par kube-prometheus-stack,
+    namespace monitoring).
+    - Prometheus évalue des règles d'alerte (ex. "pod en
+      CrashLoopBackOff depuis 5 min") et envoie les alertes déclenchées
+      à AlertManager.
+    - AlertManager les regroupe, déduplique et les ROUTE vers des
+      receivers : email, Slack... ou un webhook (c'est là qu'on
+      branchera l'agent).
+
+Q3. AlertManager est un pod ?
+R3. AlertManager est une APPLICATION (binaire Go, comme Prometheus) qui
+    tourne dans un pod : alertmanager-kube-prometheus-stack-alertmanager-0.
+    - Le "-0" indique un StatefulSet (créé par le Prometheus Operator),
+      pas un Deployment.
+    - Le "2/2" = 2 conteneurs : AlertManager + un sidecar
+      config-reloader qui recharge sa config à chaud.
+    Question ouverte posée : pourquoi un StatefulSet plutôt qu'un
+    Deployment pour ce genre de composant ?
+
+Q4. Contexte d'accès : Claude Code tourne sur un serveur Ubuntu, David
+    y est connecté en SSH.
+R4. Conséquence : un `kubectl port-forward` ouvre le port sur le
+    SERVEUR, pas sur la machine de David → son navigateur ne voit rien
+    sur localhost:9093.
+    Bonne approche : le pattern Grafana/Prometheus — un Ingress Traefik
+    + une entrée `alertmanager.remote` dans le /etc/hosts de la machine
+    cliente.
+    Exercice donné : écrire un manifeste Ingress pour AlertManager en
+    s'inspirant de l'existant (kubectl get ingress -n monitoring -o yaml).
+    Infos : namespace monitoring, service kube-prometheus-stack-alertmanager,
+    port 9093. À montrer avant d'appliquer.
+
+Q5. Quel lien entre Grafana/Prometheus et AlertManager ?
+R5. La chaîne complète :
+
+    node-exporter, kube-state-metrics... → Prometheus → AlertManager → toi
+        (exposent les métriques)   (collecte + évalue  (route, groupe,  (email, Slack,
+                                    les règles)          notifie)         webhook...)
+                    Grafana --lit--> Prometheus
+
+    - Prometheus est le cerveau : collecte les métriques, évalue les
+      règles, DÉCLENCHE les alertes.
+    - AlertManager ne détecte rien : il gère la LIVRAISON (regroupement,
+      silences, routage vers les receivers).
+    - Grafana est à part : pure visualisation, il lit Prometheus, il
+      n'est pas dans le chemin des alertes.
+    Question ouverte posée : pourquoi séparer Prometheus et
+    AlertManager ? (indice : 3 serveurs Prometheus qui détectent la
+    même panne → déduplication)
+
+
+COMMANDES VUES
+------------------------------------------------------------------------
+export KUBECONFIG=/home/david/.kube/config
+kubectl get pods -n monitoring | grep alertmanager
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-alertmanager 9093:9093 &
+curl -s http://localhost:9093/api/v2/alerts | jq '.[].labels.alertname'
+kubectl get ingress -n monitoring -o yaml
+
+
+SESSION DU 2026-07-15
+------------------------------------------------------------------------
+FAIT :
+[x] app.py testé de bout en bout : curl (fausse alerte) → Flask →
+    Ollama/Mistral → diagnostic affiché. Script de test :
+    alert-agent/test-alert.sh
+[x] Clarification archi : TOUT tourne sur llm-serveur (k3s + Ollama
+    + app.py). AlertManager (pod) joindra l'agent via
+    http://10.163.120.15:5001/alert (IP du nœud, joignable depuis
+    les pods ; app.py écoute sur 0.0.0.0).
+
+NOTIONS VUES :
+- 400 Bad Request = JSON/Content-Type invalide, rejeté avant le code.
+- host='0.0.0.0' vs '127.0.0.1' : écouter sur toutes les interfaces.
+- Trafic sortant d'un pod : passe par la pile réseau du nœud.
+- "Tourner" ≠ "être accessible" : AlertManager tourne (UI :9093,
+  réseau interne 10.42.x.x) mais sans Ingress le navigateur n'y
+  accède pas.
+- La config AlertManager vit dans un Secret k8s (géré par Helm) ;
+  actuellement tout est routé vers le receiver "null".
+
+SESSION DU 2026-09-08 — CHANGEMENT DE DIRECTION
+------------------------------------------------------------------------
+Contexte : David a exploré via claude.ai (chat) une nouvelle archi
+d'agent. app.py (Flask + webhook + Ollama) est ABANDONNÉ.
+
+NOUVELLE CIBLE : un agent de DIAGNOSTIC qui orchestre des tools.
+- Modèle : Mistral via Ollama EN LOCAL (pas Groq — pas de données du
+  cluster qui sortent vers un tiers ; Groq avait été envisagé puis
+  écarté). Rappel : Groq = API cloud d'inférence, ne télécharge pas
+  de modèle ; Ollama = exécution locale.
+- PAS de LangChain : script Python + tool-calling natif d'Ollama
+  (paramètre `tools` de l'API). Objectif pédagogique de David :
+  apprendre à construire des agents (tools + skills) sans framework
+  qui masque la mécanique.
+- Distinction posée : TOOL = fonction précise appelable par le LLM ;
+  SKILL = capacité de plus haut niveau (procédure qui enchaîne des
+  tools, ex. "diagnostiquer un CrashLoopBackOff"). On fait les tools
+  d'abord, les skills après.
+
+DESIGN DES 3 TOOLS (ordre d'usage par l'agent) :
+  1. get_pod_events   → contexte k8s natif (OOMKilled, FailedScheduling,
+     BackOff...) via `kubectl describe pod`
+  2. query_prometheus → une métrique sur une fenêtre (restarts, mém, cpu)
+     via HTTP /api/v1/query (PromQL)
+  3. search_logs      → logs applicatifs (stack trace) via Elasticsearch
+     _search, filtré ns/pod/heure
+Logique d'orchestration : events d'abord (souvent la réponse est là) →
+sinon métriques sur la fenêtre → sinon logs applicatifs.
+
+FAIT :
+[x] Tool 1 `get_pod_events(pod_name, namespace="default")` ÉCRIT ET
+    TESTÉ OK. Fichier : /home/david/claude-workspace/alert-agent/ao.py
+    - subprocess.run(["kubectl","describe","pod",pod_name,"-n",namespace],
+      capture_output=True, text=True) puis return r.stdout
+    - os.environ["KUBECONFIG"] = "/home/david/.kube/config" en tête de
+      script (le sous-processus en hérite → PAS de `export` dans la
+      commande ; commande = LISTE d'arguments, pas une chaîne)
+    - testé sur flask-demo-864cc9b79c-ggc6q (ns default) → sortie describe
+      complète (image, limites, Restart Count, Last State, Events:)
+[x] Tool 2 `query_prometheus(promql) -> str` ÉCRIT ET TESTÉ OK (session
+    2026-09-09). Même fichier alert-agent/ao.py.
+    - import requests ; url = "http://10.43.115.93:9090/api/v1/query"
+      (ClusterIP svc kube-prometheus-stack-prometheus, ns monitoring)
+    - r = requests.get(url, params={"query": promql}) ; return r.text
+    - NOTION : requests construit et URL-encode le querystring via
+      params={...} ; NE PAS coller "?query=..." dans l'url à la main
+      (sinon deux query= dans l'URL).
+    - un seul paramètre (promql) car l'URL Prometheus est fixe ; c'est
+      Mistral qui fournira le PromQL. Le tool ne filtre rien, il relaie.
+    - testé avec query_prometheus("up") → JSON brut
+      {"status":"success","data":{"resultType":"vector","result":[...]}}
+      (une série par cible scrapée). return r.text = string (verbeux
+      mais Mistral lit du JSON) ; .json() dispo si besoin de résumer.
+    - gestion d'erreur HTTP (400 PromQL invalide, 503...) : reportée,
+      voir étape dédiée ci-dessous.
+
+NOTIONS VUES (2026-09-08) :
+- Métrique = mesure numérique horodatée (nom + labels + valeur +
+  timestamp) ; 4 types : counter / gauge / histogram / summary.
+  Prometheus = système de monitoring qui EMBARQUE une base TSDB
+  (disque local, rétention ~15j, jetable, mono-usage).
+- Prometheus "voit" en PULL : GET /metrics toutes les ~30s sur des
+  cibles découvertes via l'API k8s (ServiceMonitor dit quoi scraper).
+  Une appli sans /metrics est invisible → d'où les exporters.
+- Métriques (Prometheus/Grafana) vs logs (EFK) = 2 piliers :
+  "combien / quand / tendance" vs "pourquoi / message d'erreur exact".
+- Event Kubernetes ≠ log applicatif. L'event est un OBJET de l'API
+  (kube-apiserver/etcd), produit par le plan de contrôle (scheduler,
+  kubelet, controllers), PAS par l'appli, donc PAS dans
+  /var/log/containers/*. Champs utiles : reason, message, type
+  (Normal/Warning), involvedObject, count, lastTimestamp.
+- `kubectl get events` = tous les events du ns (ou -A) ;
+  `kubectl describe pod X` = events de CE pod + son spec/status.
+- Events ÉPHÉMÈRES : k3s les garde ~1h (event-ttl). "No resources
+  found" = cluster calme, normal. Pour tester le tool il faudra
+  provoquer une panne (mauvaise image → Failed to pull ; limite mém
+  ridicule → OOMKilled).
+- subprocess est un MODULE : on appelle subprocess.run(...) ; args en
+  LISTE ; args de fonction séparés par des VIRGULES (bug rencontré :
+  virgules manquantes → SyntaxError).
+
+FAIT (suite) :
+[x] Tool 3 `search_logs(pod_name, namespace="default") -> str` ÉCRIT ET
+    TESTÉ OK (session 2026-09-09). Même fichier alert-agent/ao.py.
+    - ES joignable depuis le serveur : http://10.43.31.138:9200
+      (ClusterIP svc elasticsearch-master, ns elastic, sécurité off).
+      PAS de "elastic.remote" (seul kibana.remote existe côté client).
+    - url = ".../logstash-*/_search" : le * = tous les index quotidiens
+      logstash-2026.09.09, ...08 (un index par jour, créés par Fluent Bit).
+    - NOTION : ici POST + corps JSON (pas GET + params) car la requête
+      est imbriquée (ES Query DSL). requests.post(url, json=body) où
+      body est un dict Python -> requests le sérialise en JSON.
+    - body = {"size":20, "sort":[{"@timestamp":"desc"}],
+        "query":{"bool":{"filter":[
+          {"term":{"kubernetes.pod_name.keyword": pod_name}},
+          {"term":{"kubernetes.namespace_name.keyword": namespace}}]}}}
+      size=20 (defaut ES=10) ; sort @timestamp desc = plus recents d'abord ;
+      bool.filter = liste de conditions qui doivent TOUTES matcher ;
+      term = egalite stricte ; .keyword = version brute non analysee du
+      champ text (obligatoire pour matcher un nom de pod entier).
+    - champs d'un log : kubernetes.pod_name, kubernetes.namespace_name,
+      @timestamp (ISO8601 UTC, pose par Fluent Bit), log (le texte).
+    - return a.text = JSON brut complet (verbeux : metadata ES + _source).
+      OK pour l'instant, Mistral lit du JSON ; a resumer plus tard si besoin.
+    - RAPPEL : Fluent Bit ne collecte QUE le ns `default` (cf projet EFK).
+      Chercher un pod d'un autre ns -> 0 hit tant que la collecte n'est
+      pas etendue.
+[ ] Filtre plage horaire (reporte) : ajouter une clause `range` sur
+    @timestamp dans bool.filter (ex : logs des 15 min autour de l'alerte).
+[ ] Gestion d'erreur des tools (reportée) : tester r.returncode /
+    code HTTP, renvoyer un message clair au lieu d'une chaîne vide.
+[~] Assembler l'agent : boucle Python + Ollama tool-calling (Mistral)
+    qui choisit et enchaîne les 3 tools. EN COURS — voir session 2026-09-09 (aprem).
+[ ] Couche "skills" (procédures de diagnostic) au-dessus des tools.
+[ ] Plus tard : ServiceAccount + RBAC lecture seule quand l'agent
+    tournera en pod ; réintégrer la réception d'alertes AlertManager
+    (webhook) comme déclencheur.
+
+
+SESSION DU 2026-09-09 (APRÈS-MIDI) — DESCRIPTION DES TOOLS POUR MISTRAL
+------------------------------------------------------------------------
+Objectif de la session : commencer la boucle agent. Première brique =
+décrire chaque tool dans le format JSON que l'API Ollama attend
+(paramètre `tools`).
+
+FAIT :
+[x] `ollama pull mistral` lancé — modèle déjà à jour (même digest
+    6577803aa9a0). mistral:latest (7B) supporte le tool-calling natif.
+[x] `TOOL_GET_POD_EVENTS` écrit dans alert-agent/ao.py — dict au format
+    OpenAI/Ollama :
+      {
+        "type": "function",
+        "function": {
+          "name": "get_pod_events",          # doit matcher EXACTEMENT la fct Python
+          "description": (...),               # quand Mistral doit l'appeler + ce que ça renvoie
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "pod_name":  {"type": "string", "description": "..."},
+              "namespace": {"type": "string", "description": "..."}
+            },
+            "required": ["pod_name"]          # namespace optionnel (défaut géré par Python)
+          }
+        }
+      }
+[ ] `TOOL_QUERY_PROMETHEUS` (param `promql`, requis — c'est Mistral qui
+    rédige le PromQL) et `TOOL_SEARCH_LOGS` (pod_name + namespace) :
+    à écrire sur le même modèle. PROCHAINE ÉTAPE.
+[ ] Ensuite : la boucle while (voir mécanique ci-dessous).
+
+NOTIONS VUES (2026-09-09 aprem) :
+- Le "menu" : Mistral ne voit JAMAIS le code Python des tools. Son seul
+  lien avec eux = la description JSON qu'on lui passe. À partir de ça il
+  décide QUOI appeler et avec QUELS arguments.
+- `properties` est indispensable : c'est ce qui permet à Mistral de
+  fabriquer le JSON d'arguments (noms EXACTS des params, types, sens).
+  Sans lui → Mistral croit que la fct ne prend rien → appel à vide →
+  TypeError missing argument. `required` dit lesquels sont obligatoires.
+- Le défaut de `namespace` est géré par la SIGNATURE Python
+  (def get_pod_events(pod_name, namespace="default")), pas par le schema.
+  Le schema ne fait que documenter (namespace hors de `required`).
+- "default" dans la description = le NOM du namespace k8s, pas un mot-clé.
+- Chaîne longue en Python : pas de continuation avec `/` ni `\` dans le
+  texte. Soit une seule ligne, soit concaténation implicite de chaînes
+  adjacentes entre parenthèses :
+      "description": (
+          "phrase 1 "
+          "phrase 2"
+      ),
+- La variable EST le dict : `TOOL_X = { "type": ..., "function": ... }`
+  — une seule paire d'accolades, pas un dict qui enveloppe un dict.
+- Choix d'Ollama vs alternatives locales (llama.cpp brut, vLLM pour
+  servir à plusieurs/GPU, LM Studio, LocalAI) : Ollama gagne ici car
+  pull + API REST :11434 + paramètre `tools` natif, zéro config. On
+  regarderait vLLM si l'agent devait encaisser beaucoup d'alertes en //.
+
+MÉCANIQUE DE LA BOUCLE AGENT (à coder ensuite) :
+  1. messages = [ {role:"user", content: <l'alerte / la demande>} ]
+  2. appel Ollama chat avec messages + tools=[les 3 dicts]
+  3. la réponse contient SOIT du texte (=> fini, on affiche) SOIT des
+     message.tool_calls (nom + arguments JSON)
+  4. si tool_calls : pour chacun, exécuter la fct Python correspondante,
+     append {role:"tool", content: <résultat>} dans messages, puis
+     RE-boucler en 2
+  5. sinon : sortir, afficher message.content
+  Le LLM ne fait rien lui-même : il DEMANDE, c'est notre code qui exécute.
+
+
+SESSION DU 2026-09-10 — 3 DESCRIPTIONS JSON OK + 1er APPEL OLLAMA
+------------------------------------------------------------------------
+Objectif : finir les descriptions des tools et lancer le 1er appel au
+modèle.
+
+FAIT :
+[x] `TOOL_QUERY_PROMETHEUS` et `TOOL_SEARCH_LOGS` écrits dans
+    alert-agent/ao.py, sur le modèle de `TOOL_GET_POD_EVENTS`.
+    - query_prometheus : 1 param `promql` (string, requis — c'est le
+      LLM qui rédige le PromQL).
+    - search_logs : `pod_name` requis + `namespace` optionnel.
+    - Bugs corrigés en route : `"name"` doit matcher EXACTEMENT la
+      fonction Python (query_prometheus, pas "query-prometheus") ;
+      guillemets DOUBLES imbriqués dans une description -> ferment la
+      chaîne (SyntaxError), mettre des simples : {pod='...'} ;
+      accolades à équilibrer (compter ouvrantes/fermantes) ;
+      `TOOL_X = { {...} }` (accolade en trop) = un set contenant un
+      dict -> TypeError unhashable à l'exécution.
+[x] Annuaire `TOOLS = {"get_pod_events": get_pod_events, ...}` ajouté
+    APRÈS les `def` (nom string -> objet fonction ; sert à faire
+    TOOLS[nom](**args) dans la boucle). Fonction rangée SANS parenthèses.
+[x] `print(...)` de test des 3 tools commentés (l.84, 93, 112) — ils
+    s'exécutaient à chaque run et search_logs déversait tout le JSON ES.
+[x] pip `ollama` (client Python) INSTALLÉ DANS LE VENV
+    (alert-agent/venv). Le python3 SYSTÈME est verrouillé PEP 668
+    (externally-managed) -> lancer avec ./venv/bin/python ao.py, PAS
+    python3 ao.py.
+    PIÈGE RENCONTRÉ : un fichier local `ollama.py` (brouillon) masquait
+    le vrai paquet -> `module 'ollama' has no attribute 'chat'`.
+    Supprimé. Règle : ne jamais nommer un fichier comme un module importé.
+[x] 1er appel `ollama.chat(model=..., messages=[alerte], tools=[3 dicts])`
+    écrit et lancé (bloc "BOUCLE AGENT" en bas de ao.py).
+
+RÉSULTAT / NOTIONS :
+- `print(reponse)` affiche TOUT l'objet renvoyé par l'API Ollama :
+  le `message` PLUS des stats de perf (total_duration, eval_count,
+  prompt_eval_count, tokens...). Toujours présentes, on les ignore ;
+  on lit `reponse.message.tool_calls` / `.content` / `.thinking`.
+- mistral:latest = Mistral 7B Instruct v0.3, Q4_K_M (digest 6577803aa9a0).
+  Capability `tools` mais FAIBLE : il a "raconté" les appels en texte
+  (tool_calls=None) puis carrément HALLUCINÉ une fausse sortie de tool
+  (un traceback Python inventé). Le message system n'a pas suffi.
+- BASCULE sur `qwen3.5` (déjà pullé, 6,6 Go) : IMMÉDIATEMENT correct —
+  `thinking` = raisonnement, puis vrai `tool_calls=[ToolCall(function=
+  Function(name='get_pod_events', arguments={'pod_name': ...,
+  'namespace': 'default'}))]`. C'est le modèle à garder pour le
+  tool-calling.
+- qwen ne demande QU'UN tool à la fois : un seul appel ne montre que le
+  1er pas. Il faut la boucle pour enchaîner.
+
+RESTE À FAIRE :
+[~] La boucle `while` (mécanique ci-dessous) : elle avait été écrite
+    puis ANNULÉE à la demande de David (il veut la refaire lui-même,
+    pas à pas). ao.py est repassé à un seul appel + print(reponse).
+    -> PROCHAINE ÉTAPE : réécrire la boucle avec David.
+[ ] Filtre plage horaire dans search_logs (clause `range` sur @timestamp).
+[ ] Gestion d'erreur des tools (returncode / code HTTP -> message clair).
+[ ] Couche "skills" au-dessus des tools.
+[ ] Plus tard : ServiceAccount + RBAC lecture seule (agent en pod) ;
+    réintégrer le webhook AlertManager comme déclencheur.
+[ ] Ménage : fichiers en double dans alert-agent/ (getpodsevents.py,
+    get_pod_events.py, searchlogs.py, search_logs.py, query-prometheus.py,
+    query_prometheus.py, ollama.py supprimé, resume.py) — ao.py est la
+    référence.
+
+SESSION DU 2026-09-11 — BOUCLE AGENT : 1 ALLER-RETOUR MANUEL RÉUSSI
+------------------------------------------------------------------------
+Objectif : construire pas à pas (David code, Claude explique une notion
+à la fois) le mécanisme demande-tool → exécution → résultat → décision,
+AVANT de l'enrouler dans un vrai `while`.
+
+FAIT :
+[x] Ajout dans ao.py, après le 1er `ollama.chat` (celui qui existait déjà) :
+      if reponse.message.tool_calls:
+          appel = reponse.message.tool_calls[0]
+          nom_tool = appel.function.name
+          arguments = appel.function.arguments
+          resultat = TOOLS[nom_tool](**arguments)
+          print(resultat)
+
+          messages.append(reponse.message)
+          messages.append({"role": "tool", "content": resultat})
+
+          reponse2 = ollama.chat(
+              model="qwen3.5",
+              messages=messages,
+              tools=[TOOL_GET_POD_EVENTS, TOOL_QUERY_PROMETHEUS, TOOL_SEARCH_LOGS],
+          )
+          print(reponse2)
+[x] Testé de bout en bout : qwen demande get_pod_events → Python exécute
+    réellement `kubectl describe pod` (pas juste affiché, vraiment lancé)
+    → résultat renvoyé au modèle via messages.append → reponse2 contient
+    un diagnostic texte en français (content rempli, tool_calls=None) :
+    "Le pod redémarre 26 fois... ErrImagePull... limite mémoire 128Mi
+    trop basse... augmentez à 256Mi..." → qwen a jugé avoir assez
+    d'infos et n'a PAS redemandé de tool.
+[x] Confusions clarifiées en route (à réexpliquer si ça revient) :
+    - tool_calls[0] : le [0] porte sur la liste RENVOYÉE PAR LE MODÈLE
+      (reponse.message.tool_calls), PAS sur la liste `tools=[...]` du
+      menu qu'on lui donne. Ce sont deux listes indépendantes ; l'ordre
+      du menu n'a aucun rapport avec quel tool est choisi.
+    - `thinking` (raisonnement libre, souvent en anglais même si la
+      consigne demande le français) ≠ `tool_calls` (la demande
+      structurée, seule chose que le code doit lire pour agir). Le
+      thinking n'est jamais exécutable, juste explicatif.
+    - Tant qu'on n'a que `print(reponse)`, RIEN n'est exécuté : c'est
+      juste la demande affichée. L'exécution réelle vient de
+      `TOOLS[nom_tool](**arguments)`.
+    - Analogie qui a débloqué la compréhension du principe général :
+      qwen = médecin qui demande un examen (tool_calls), ao.py =
+      infirmière qui l'exécute vraiment et redonne le résultat ; le
+      médecin décide ensuite de conclure ou redemander un examen.
+[x] David a mentionné un projet antérieur, Nova : un chatbot Streamlit
+    (fichier vu en session, pas encore localisé dans le repo) qui
+    appelle Ollama /api/chat, avec historique st.session_state.messages
+    et affichage via st.chat_message — actuellement branché sur
+    "mistral" en dur. Nova sait déjà bien afficher (contrairement au
+    print brut de ao.py). Idée retenue pour plus tard : une fois la
+    boucle agent terminée dans ao.py, la brancher à la place du simple
+    requests.post de Nova pour avoir un vrai chatbot d'agent avec UI
+    propre. PAS fait maintenant — priorité = finir la logique du while.
+
+RESTE À FAIRE :
+[ ] Généraliser ce bloc en vrai `while` (boucler tant que tool_calls
+    n'est pas vide, gérer aussi le cas où le 1er appel répond direct
+    sans tool). PROCHAINE ÉTAPE, David fait une pause avant de continuer.
+[ ] print(reponse2) est brut/illisible (David : "le format est moche") ;
+    remplacer par print(reponse2.message.content) une fois le while en
+    place — pas de vraie UI avant que la logique marche.
+[ ] Filtre plage horaire dans search_logs (clause `range` sur @timestamp).
+[ ] Gestion d'erreur des tools (returncode / code HTTP -> message clair).
+[ ] Couche "skills" au-dessus des tools.
+[ ] Plus tard : ServiceAccount + RBAC lecture seule (agent en pod) ;
+    réintégrer le webhook AlertManager comme déclencheur ; éventuelle
+    UI Streamlit façon Nova branchée sur la boucle agent.
+[ ] Ménage : fichiers en double dans alert-agent/ (getpodsevents.py,
+    get_pod_events.py, searchlogs.py, search_logs.py, query-prometheus.py,
+    query_prometheus.py, resume.py) — ao.py est la référence.
+
+SESSION DU 2026-09-13 — INCIDENT RÉEL OOMKILLED + ÉCHEC DE SYNTHÈSE QWEN3.5
+    + BASCULE VERS UN MODÈLE HÉBERGÉ (GROQ)
+------------------------------------------------------------------------
+FAIT :
+[x] Boucle `while reponse.message.tool_calls:` généralisée dans ao.py
+    (faite entre le 09-11 et le 09-13, non journalisée en détail) :
+    tant qu'il y a des tool_calls, exécute TOOLS[nom](**args), append
+    reponse.message + {"role":"tool","content":resultat} à messages,
+    rappelle ollama.chat, jusqu'à sortie (tool_calls vide) puis
+    print(reponse.message.content).
+[x] Premier test de bout en bout (ns default, pod flask-demo healthy,
+    prompt user mentant "redémarre en boucle") → qwen3.5 a répondu en
+    ANGLAIS, format markdown (###, emojis), a posé une question à
+    l'utilisateur (vérifier l'horloge système) → violation totale du
+    system prompt pourtant déjà renforcé (français, 5 lignes max, pas
+    de question). Cause identifiée : contradiction entre la prémisse du
+    prompt (pod en boucle) et la réalité (pod stable, 27 restarts mais
+    dernier redémarrage il y a 2j) → le modèle a trouvé des logs de
+    health-check propres et a dérivé vers un rapport générique au lieu
+    de signaler la contradiction.
+[x] Incident réel provoqué pour retester : limite mémoire de
+    flask-demo/k8s/deployment.yaml abaissée à 20Mi (limits ET requests,
+    k8s exige requests<=limits) → `kubectl apply` → nouveau pod
+    flask-demo-5d9ccbb686-pk74q en CrashLoopBackOff/OOMKilled confirmé
+    (kubectl get pods). ao.py mis à jour avec ce nouveau nom de pod
+    (contenu du prompt user laissé tel quel : "redémarre en boucle",
+    devenu vrai pour ce pod).
+[x] Relancé : qwen3.5 a enchaîné get_pod_events (a bien lu OOMKilled,
+    CrashLoopBackOff, Restart Count 5, memory limit 20Mi — diagnostic
+    correct à ce stade) PUIS a sauté query_prometheus et est allé direct
+    à search_logs (logs de démarrage propres, pod OOMKilled avant
+    d'avoir pu logger une erreur) → **conclusion finale FAUSSE** :
+    "Healthy / Started Successfully", en anglais, formaté façon
+    assistant générique (### titres, emojis), a complètement IGNORÉ
+    l'OOMKilled trouvé à l'étape 1 alors que le system prompt dit
+    explicitement de se baser sur TOUTES les infos, pas seulement la
+    dernière. Contexte à ce moment : 4096 tokens (738→2468→4096 d'un
+    appel à l'autre) ; dernier appel a mis >10 min (total_duration
+    636s).
+[x] Vérification ressources serveur : PAS de GPU (`nvidia-smi`
+    absent), RAM totale 14 Gio dont ~300 Mio libres au moment du test →
+    tout tourne CPU-only, en partageant la RAM avec tout le cluster.
+    Un modèle local plus gros que qwen3.5 (6,6 Go) risquerait de ne pas
+    tenir ou d'être encore plus lent.
+
+NOTIONS VUES :
+- Un pod OOMKilled a souvent des logs applicatifs "propres" (le kernel
+  tue le process avant qu'il ait pu logger une erreur) → chercher une
+  erreur dans les logs est un piège classique dans ce cas précis ; il
+  faut garder en mémoire les events, pas juste le dernier tool result.
+- Qwen3.5 (7B quantifié, CPU-only) ignore sa propre consigne de
+  synthèse ("base ta conclusion sur TOUTES les infos") dès que le
+  contexte s'allonge (738→4096 tokens) → hypothèse : dilution du poids
+  du system message face au contenu récent. Confirmé factuellement une
+  fois (diagnostic final contraire aux events trouvés en 1er).
+- Différence tool/modèle générique : ni qwen3.5 (Ollama) ni Claude Code
+  n'exécutent de commande "eux-mêmes" — un LLM ne fait que DEMANDER un
+  tool_call ; c'est le programme autour (la boucle Python d'ao.py côté
+  David, le CLI Claude Code côté Claude) qui exécute réellement et
+  renvoie le résultat. Claude Code utilise un tool générique (Bash, +
+  permissions/sandboxing) ; ao.py utilise 3 tools précis et fermés —
+  choix délibéré et cohérent avec un agent censé tourner seul en pod
+  (RBAC read-only prévu), sans système de permissions.
+
+DÉCISION — CHANGEMENT D'ARCHITECTURE (revient sur la décision du
+09-08) :
+[x] David choisit de basculer sur un **modèle hébergé** plutôt que
+    local (Ollama/qwen3.5 jugé insuffisant en fiabilité + trop lent sur
+    ce hardware CPU-only 14 Gio RAM sans GPU). Confidentialité des
+    données du cluster (raison du rejet initial de Groq le 09-08)
+    explicitement mise de côté pour ce choix.
+[x] Fournisseur choisi : **Groq** (cloud d'inférence, API compatible
+    OpenAI — le format `tools` déjà écrit pour Ollama, type function +
+    parameters, est directement réutilisable, quasi aucune conversion
+    de schéma nécessaire). Free tier confirmé existant (limites par
+    modèle : RPM/RPD/TPM/TPD), pas de carte bancaire a priori (à
+    vérifier à l'inscription).
+[x] Modèle retenu : **`openai/gpt-oss-120b`** (gratuit, supporte le
+    tool-calling agentique, 500 tokens/s) — préféré à `gpt-oss-20b`
+    pour la fiabilité du raisonnement vu les ratés de qwen3.5.
+
+RESTE À FAIRE :
+[ ] David : créer un compte gratuit sur console.groq.com, générer une
+    clé API, `./venv/bin/pip install groq`, `export GROQ_API_KEY=...`.
+[ ] Adapter ao.py : remplacer `import ollama` / `ollama.chat(...)` par
+    le client `groq` (API compatible OpenAI : `client.chat.completions
+    .create(model=..., messages=..., tools=[...])`, lire
+    `response.choices[0].message.tool_calls`). Les 3 TOOL_* dicts
+    restent quasi inchangés.
+[ ] Retester le scénario OOMKilled avec gpt-oss-120b, vérifier que le
+    diagnostic final est correct ET respecte le format demandé.
+[ ] Filtre plage horaire dans search_logs (clause `range` sur
+    @timestamp).
+[ ] Gestion d'erreur des tools (returncode / code HTTP → message
+    clair).
+[ ] Couche "skills" au-dessus des tools.
+[ ] Plus tard : ServiceAccount + RBAC lecture seule (agent en pod) ;
+    réintégrer le webhook AlertManager comme déclencheur ; éventuelle
+    UI Streamlit façon Nova branchée sur la boucle agent.
+[ ] Ménage : fichiers en double dans alert-agent/ (getpodsevents.py,
+    get_pod_events.py, searchlogs.py, search_logs.py,
+    query-prometheus.py, query_prometheus.py, resume.py) — ao.py est
+    la référence.
+[ ] Point pédagogie ouvert : David a dit "le problème c'est que
+    j'oublie tout" (session 09-13). Pistes proposées : (a) un
+    pense-bête séparé du journal narratif (commandes clés + concepts,
+    lecture rapide) ; (b) systématiser un récapitulatif "où on en est
+    et pourquoi" avant chaque étape. Pas encore tranché avec David.
+
+--- ANCIENNES ÉTAPES (archi app.py abandonnée, gardées pour mémoire) ---
+[~] Ingress alertmanager.remote / receiver webhook / lancer app.py
+    durablement : suspendu, dépend de la nouvelle archi.
+
+SESSION DU 2026-10-17 — skill_pod_crash GÉNÉRALISÉE EN skill_scan_cluster
+------------------------------------------------------------------------
+NOTE : le dossier du projet a été renommé entre deux sessions, de
+alert-agent/ vers AGENT-OBSERVABILITE/ (même contenu, même fichiers).
+
+FAIT :
+[x] Demande de David : la skill ne doit plus prendre un pod_name précis
+    en entrée, elle doit balayer TOUT le cluster et diagnostiquer tous
+    les pods en problème elle-même. Ajouté dans ao.py :
+    - `get_problem_pods()` : `kubectl get pods -A -o json`, parse le
+      JSON, garde les pods dont un containerStatus a `state.waiting.reason`
+      dans (CrashLoopBackOff, ImagePullBackOff, ErrImagePull) ou
+      `state.terminated.reason == OOMKilled`. Renvoie une liste de
+      tuples (namespace, nom).
+    - `skill_scan_cluster()` : boucle `get_problem_pods()` puis appelle
+      `skill_pod_crash(nom, namespace)` pour chacun, renvoie un dict
+      {"namespace/pod": diagnostic}.
+[x] `test_skill.py` réécrit pour tester `skill_scan_cluster()` au lieu de
+    `skill_pod_crash()` (import mis à jour, boucle d'affichage propre
+    avec `print(f"=== {pod} ===")` au lieu d'un print brut du dict).
+[x] Condition de test recréée sur le cluster : les pods `whoami`
+    n'étaient plus en crash (la limite 4Mi posée le 2026-10-10 ne
+    suffisait plus). Limite abaissée à 2Mi dans
+    `whoami-test/k8s/whoami.yaml` (limits ET requests) + `kubectl apply`
+    → nouveaux pods confirmés OOMKilled (exit code 137).
+[x] Test exécuté avec succès : `skill_scan_cluster()` a bien trouvé les
+    2 pods whoami en problème SANS qu'on lui donne leur nom, et a rendu
+    un diagnostic correct pour chacun (limite mémoire 2Mi insuffisante,
+    OOMKilled, recommandation d'augmenter à ≥64Mi).
+[x] Bug de forme trouvé par David ("la réponse est moche") : le LLM
+    utilisait du markdown (**gras**) et `print(resultat)` affichait le
+    dict Python brut (repr, `\n` échappés). Corrigé :
+    - system prompt de `skill_pod_crash` : ajout de la consigne "texte
+      brut SANS markdown (pas de **, pas de #, pas de listes à puces)".
+    - `test_skill.py` : boucle sur `resultats.items()` et affiche
+      chaque diagnostic avec un vrai retour à la ligne au lieu du dict.
+
+RESTE À FAIRE :
+[ ] Retester après la correction markdown pour vérifier le rendu.
+[ ] Repasser la limite mémoire whoami à une valeur normale une fois les
+    tests finis (actuellement 2Mi, pods en crash permanent sur le
+    cluster tant que ça reste ainsi).
+[ ] Filtre plage horaire dans search_logs, gestion d'erreur des tools,
+    IP ClusterIP en dur à remplacer par DNS interne (reste de la liste
+    des sessions précédentes, toujours pas fait).

@@ -5,27 +5,42 @@ sur Prometheus (métriques), Elasticsearch (logs) et `kubectl` (events), avec un
 hébergé (Groq) pour la synthèse finale en langage naturel.
 
 Projet mentorat : le code est écrit par David, Claude accompagne pas à pas (sauf
-indication contraire dans l'historique ci-dessous).
+indication contraire dans l'historique ci-dessous). Tout le code actif est dans **`ao.py`**.
 
-## Fichier principal
+Il y a 2 façons de diagnostiquer dans ce fichier, détaillées ci-dessous.
 
-Tout le code actif est dans **`ao.py`**. Il contient, dans l'ordre :
+## 1. Agent IA avec tools : le LLM diagnostique les problèmes kube
 
-1. **3 tools** (fonctions appelables par un LLM) :
-   - `get_pod_events(pod_name, namespace="default")` — `kubectl describe pod`, lit les events (OOMKilled, CrashLoopBackOff, FailedScheduling...)
-   - `query_prometheus(promql)` — requête HTTP sur l'API Prometheus (`/api/v1/query`)
-   - `search_logs(pod_name, namespace="default")` — requête Elasticsearch, renvoie les logs applicatifs récents d'un pod
-   - Chaque tool a une description JSON associée (`TOOL_GET_POD_EVENTS`, etc.) et un annuaire `TOOLS` (nom string → fonction Python) pour que le LLM puisse les désigner par leur nom.
+Le LLM reçoit 3 tools et décide **lui-même** lequel appeler et dans quel ordre, en
+boucle, jusqu'à produire une conclusion.
 
-2. **`diagnostiquer(probleme)`** — agent "generaliste" : le LLM (Groq, `openai/gpt-oss-120b`) reçoit les 3 tools en option (`tools=[...]`) et **décide lui-même** quel tool appeler et dans quel ordre, en boucle (`while ... tool_calls`), jusqu'à produire une conclusion en texte. Utilisé par le chatbot Streamlit (`main_streamlit.py` / Nova).
+- **3 tools** (fonctions appelables par le LLM) :
+  - `get_pod_events(pod_name, namespace="default")` — `kubectl describe pod`, lit les events (OOMKilled, CrashLoopBackOff, FailedScheduling...)
+  - `query_prometheus(promql)` — requête HTTP sur l'API Prometheus (`/api/v1/query`)
+  - `search_logs(pod_name, namespace="default")` — requête Elasticsearch, renvoie les logs applicatifs récents d'un pod
+  - Chaque tool a une description JSON associée (`TOOL_GET_POD_EVENTS`, etc.) et un annuaire `TOOLS` (nom string → fonction Python) pour que le LLM puisse les désigner par leur nom.
 
-3. **`skill_pod_crash(pod_name, namespace="default")`** — skill pour diagnostiquer UN pod déjà identifié comme en panne. Différence clé avec `diagnostiquer()` : c'est **le code Python** qui décide l'ordre des appels (`get_pod_events` toujours, puis `query_prometheus` si `OOMKilled`, ou `search_logs` si `CrashLoopBackOff`/`Error`), pas le modèle. Le LLM n'est appelé **qu'une fois**, à la fin, pour rédiger la conclusion à partir du contexte déjà assemblé (pas de `tools=[...]` dans cet appel).
+- **`diagnostiquer(probleme)`** — le LLM (Groq, `openai/gpt-oss-120b`) reçoit les 3 tools en option (`tools=[...]`) et décide seul quel tool appeler, en boucle (`while ... tool_calls`), jusqu'à produire une conclusion en texte. **Chaque tour de boucle = un appel LLM**, donc le coût en tokens dépend du nombre de tools que le modèle choisit d'enchaîner. Utilisé par le chatbot Streamlit (`main_streamlit.py` / Nova).
 
-4. **`get_problem_pods()`** — scanne tout le cluster (`kubectl get pods -A -o json`) et repère seul les pods en `CrashLoopBackOff` / `ImagePullBackOff` / `ErrImagePull` / `OOMKilled`, sans nom de pod fourni en entrée.
+```bash
+./venv/bin/streamlit run main_streamlit.py
+```
 
-5. **`skill_scan_cluster()`** — combine les deux précédents : liste les pods en problème via `get_problem_pods()`, puis appelle `skill_pod_crash` sur chacun. Retourne un dict `{"namespace/nom": diagnostic}`.
+Interface de chat qui appelle `diagnostiquer(prompt)` à chaque message — utile pour
+poser une question libre plutôt que lancer un scan complet du cluster.
 
-## Lancer un test
+## 2. Agent IA skillé : diagnostique en consommant moins de tokens
+
+Ici, c'est **le code Python** qui décide l'ordre des appels aux mêmes tools — le LLM
+n'est plus sollicité pour choisir, seulement pour rédiger la conclusion finale.
+**Un seul appel LLM par pod**, quel que soit le nombre de tools exécutés avant — d'où
+la consommation de tokens plus faible que l'agent avec tools.
+
+- **`skill_pod_crash(pod_name, namespace="default")`** — diagnostique UN pod déjà identifié comme en panne. `get_pod_events` est toujours appelé, puis `query_prometheus` si `OOMKilled`, ou `search_logs` si `CrashLoopBackOff`/`Error` — c'est un `if`/`elif` dans le code qui en décide, pas le modèle. Le LLM n'est appelé qu'à la fin (pas de `tools=[...]` dans cet appel), pour synthétiser le contexte déjà assemblé.
+
+- **`get_problem_pods()`** — scanne tout le cluster (`kubectl get pods -A -o json`) et repère seul les pods en `CrashLoopBackOff` / `ImagePullBackOff` / `ErrImagePull` / `OOMKilled`, sans nom de pod fourni en entrée.
+
+- **`skill_scan_cluster()`** — combine les deux précédents : liste les pods en problème via `get_problem_pods()`, puis appelle `skill_pod_crash` sur chacun. Retourne un dict `{"namespace/nom": diagnostic}`.
 
 ```bash
 cd AGENT-OBSERVABILITE
@@ -36,15 +51,6 @@ cd AGENT-OBSERVABILITE
 PEP 668) — c'est lui qui a les packages installés (`groq`, `requests`...).
 `test_skill.py` importe `skill_scan_cluster`, l'exécute, et affiche chaque diagnostic
 proprement (un bloc `=== namespace/nom ===` par pod).
-
-## Chatbot Nova (Streamlit)
-
-```bash
-./venv/bin/streamlit run main_streamlit.py
-```
-
-Interface de chat qui appelle `diagnostiquer(prompt)` à chaque message — utile pour
-poser une question libre plutôt que lancer un scan complet du cluster.
 
 ## État actuel / reste à faire
 
