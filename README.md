@@ -29,7 +29,7 @@ boucle, jusqu'à produire une conclusion.
 Interface de chat qui appelle `diagnostiquer(prompt)` à chaque message — utile pour
 poser une question libre plutôt que lancer un scan complet du cluster.
 
-## 2. Agent IA skillé : diagnostique en consommant moins de tokens
+## 2. Agent IA basé sur des skills : diagnostique en consommant moins de tokens
 
 Ici, c'est **le code Python** qui décide l'ordre des appels aux mêmes tools — le LLM
 n'est plus sollicité pour choisir, seulement pour rédiger la conclusion finale.
