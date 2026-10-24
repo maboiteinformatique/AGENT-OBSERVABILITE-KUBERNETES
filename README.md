@@ -47,30 +47,4 @@ cd AGENT-OBSERVABILITE
 ./venv/bin/python test_skill.py
 ```
 
-`./venv/bin/python` est l'interpréteur du venv local (pas le Python système, verrouillé
-PEP 668) — c'est lui qui a les packages installés (`groq`, `requests`...).
-`test_skill.py` importe `skill_scan_cluster`, l'exécute, et affiche chaque diagnostic
-proprement (un bloc `=== namespace/nom ===` par pod).
 
-## État actuel / reste à faire
-
-- `skill_scan_cluster` testée avec succès sur des pods `whoami` en OOMKilled (limite
-  mémoire volontairement abaissée dans `whoami-test/k8s/whoami.yaml` pour provoquer le
-  crash). **Cette limite basse (2Mi) est restée appliquée** sur le cluster — à remettre
-  à une valeur normale si on n'a plus besoin de ce scénario de test.
-- `query_prometheus` et `search_logs` utilisent des IP `ClusterIP` en dur dans `ao.py`
-  (Prometheus, Elasticsearch) — fragile si les Services sont recréés. À remplacer par
-  les noms DNS internes (`<service>.<namespace>.svc.cluster.local`).
-- Pas de gestion d'erreur sur les tools (ex: timeout HTTP, pod inexistant).
-- Pas de couche "skills" au-delà de `skill_pod_crash` / `skill_scan_cluster`.
-- Mise en prod (webhook AlertManager en déclencheur, image Docker + Deployment k8s,
-  ServiceAccount RBAC read-only dédié, clé Groq en Secret) **différée** — on travaille
-  encore l'agent lui-même avant d'y passer.
-- Autres fichiers présents dans le dossier (`ao-modele_local.py`, `ao_modele_externe.py`,
-  `get_pod_events.py`, `query_prometheus.py`, `search_logs.py`, `resume.py`) sont des
-  brouillons/versions antérieures, non branchés sur le code actif.
-
-## Historique détaillé
-
-Le journal complet des sessions (décisions, bugs rencontrés, pédagogie) est dans
-`agent-ia-alertmanager.txt`, à lire en début de session avant de reprendre le projet.
