@@ -235,12 +235,3 @@ def skill_scan_cluster():
     for namespace, nom in get_problem_pods():
         resultats[f"{namespace}/{nom}"] = skill_pod_crash(nom, namespace)
     return resultats
-
-
-"""Test des tools:
-
-#print(get_pod_events("flask-demo-864cc9b79c-ggc6q", "default"))
-#print(query_prometheus('up'))
-#print(search_logs("flask-demo-864cc9b79c-ggc6q"))
-
-"""
