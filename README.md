@@ -4,8 +4,7 @@ Agent de diagnostic qui analyse les pods en problème sur le cluster k8s, en s'a
 sur Prometheus (métriques), Elasticsearch (logs) et `kubectl` (events), avec un LLM
 hébergé (Groq) pour la synthèse finale en langage naturel.
 
-Projet mentorat : le code est écrit par David, Claude accompagne pas à pas (sauf
-indication contraire dans l'historique ci-dessous). Tout le code actif est dans **`ao.py`**.
+Projet mentorat : le code est écrit par David. Tout le code actif est dans **`ao.py`**.
 
 Il y a 2 façons de diagnostiquer dans ce fichier, détaillées ci-dessous.
 
